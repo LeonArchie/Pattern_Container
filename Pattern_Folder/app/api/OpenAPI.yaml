@@ -1,0 +1,15 @@
+openapi: 3.0.0
+info:
+  title: Configuration Management API
+  description: API для у
+  version: 1.0.0
+  contact:
+    name: Ответсвенный
+  license:
+    name: AGPL-3.0-only WITH LICENSE-ADDITIONAL
+
+servers:
+  - url: http://app-service:5000
+    description: Локальный сервер разработки (v1 API)
+
+paths:

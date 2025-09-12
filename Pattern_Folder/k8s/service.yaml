@@ -1,0 +1,12 @@
+apiVersion: v1             # Версия API для работы с Services
+kind: Service              # Тип ресурса Kubernetes - Service
+metadata:
+  name: flask-app-service  # Имя сервиса в кластере
+spec:
+  selector:
+    app: flask-app         # Селектор для pod'ов, которые будут частью сервиса
+  ports:
+    - protocol: TCP        # Протокол для работы сервиса
+      port: 5000             # Порт, на котором сервис будет доступен внутри кластера
+      targetPort: 5000     # Порт контейнера, на который перенаправлять трафик
+  type: ClusterIP        # Тип сервиса (создает внешний LB в облачных провайдерах)
