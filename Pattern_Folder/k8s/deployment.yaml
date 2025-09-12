@@ -21,7 +21,7 @@ spec:
       - name: flask-app    # Имя контейнера внутри pod'а
         image: "{{IMAGE_NAME}}"  # Используемый Docker образ
         ports:
-        - containerPort: 5000  # Порт, который открывает контейнер
+        - containerPort: 9443  # Порт, который открывает контейнер
         stdin: true   # Разрешить интерактивный ввод
         tty: true     # Выделить TTY
         env:                   # Переменные окружения
@@ -33,16 +33,16 @@ spec:
             memory: "32Mi"   # Запрашиваем 128 MiB памяти
           limits:
             cpu: "50m"       # Лимит 0.5 CPU
-            memory: "64Mi"   # Лимит 512 MiB памяти
+            memory: "128Mi"   # Лимит 512 MiB памяти
         livenessProbe:
           httpGet:
             path: /healthz  # или правильный путь для вашего приложения
-            port: 5000
-          initialDelaySeconds: 30
+            port: 9443
+          initialDelaySeconds: 60
           periodSeconds: 10
         readinessProbe:
           httpGet:
             path: /readyz   # или правильный путь для вашего приложения
-            port: 5000
-          initialDelaySeconds: 30
+            port: 9443
+          initialDelaySeconds: 60
           periodSeconds: 10

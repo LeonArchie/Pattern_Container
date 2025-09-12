@@ -1,3 +1,10 @@
-__pycache__/
-*.pyc
 .git
+.gitignore
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.venv
+Dockerfile
+.dockerignore
+README.md

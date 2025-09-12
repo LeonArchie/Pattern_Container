@@ -1,24 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH LICENSE-ADDITIONAL
 # Copyright (C) 2025 Петунин Лев Михайлович
 
-"""
-migration.py - Система управления миграциями базы данных
-
-Этот модуль предоставляет полный набор инструментов для управления миграциями БД:
-1. Поиск и валидация файлов миграций
-2. Создание и поддержка таблицы applied_migrations для отслеживания выполненных миграций
-3. Выполнение SQL-миграций с поддержкой транзакций и отката при ошибках
-4. Контроль целостности через SHA-256 checksum файлов миграций
-5. Подробное логирование каждого этапа процесса миграции
-6. Поддержка multi-tenant архитектуры через поле name_app
-
-Особенности реализации:
-- Поддержка dollar-quoted строк в SQL ($$tag$$content$$tag$$)
-- Разделение SQL-скриптов на отдельные запросы с учетом особенностей синтаксиса
-- Детальное отслеживание статуса выполнения каждой миграции
-- Глобальный флаг migration_complete для мониторинга состояния системы
-"""
-
 import os
 import re
 import hashlib
@@ -46,7 +28,7 @@ class MigrationError(Exception):
         super().__init__(message)
 
 def _log_migration_step(step: str, details: str = "", level: str = "info") -> None:
-    """Унифицированное логирование шагов миграции с форматированием"""
+    """Унифицированное логирование шагов миграции"""
     log_method = getattr(logger, level.lower(), logger.info)
     border = "=" * 40
     log_method(f"\n{border}\nМИГРАЦИЯ: {step}\n{details}\n{border}")
@@ -54,12 +36,6 @@ def _log_migration_step(step: str, details: str = "", level: str = "info") -> No
 def get_app_name() -> str:
     """
     Получает имя приложения из файла global.conf
-    
-    Возвращает:
-        str: Имя приложения из конфигурационного файла
-        
-    Исключения:
-        MigrationError: Если файл не найден или параметр NAME_APP отсутствует
     """
     try:
         current_dir = Path(__file__).parent.parent
@@ -91,12 +67,6 @@ def get_app_name() -> str:
 def get_migration_files() -> List[str]:
     """
     Получаем список файлов миграций в правильном порядке
-    
-    Возвращает:
-        List[str]: Отсортированный список валидных файлов миграций
-        
-    Исключения:
-        MigrationError: Если директория миграций не существует или недоступна
     """
     try:
         current_dir = Path(__file__).parent.parent
@@ -115,7 +85,7 @@ def get_migration_files() -> List[str]:
         for f in migrations_dir.iterdir():
             if f.is_file() and f.suffix == '.sql':
                 files.append(f.name)
-                if re.match(r'^\d{3}-.+\.sql$', f.name):  # Паттерн: 001-миграция.sql
+                if re.match(r'^\d{3}-.+\.sql$', f.name):
                     valid_files.append(f.name)
 
         _log_migration_step(
@@ -129,7 +99,7 @@ def get_migration_files() -> List[str]:
             _log_migration_step("Нет миграций", "Валидные миграции не найдены", "warning")
             return []
 
-        sorted_files = sorted(valid_files)  # Сортировка по имени (порядковый номер)
+        sorted_files = sorted(valid_files)
         _log_migration_step(
             "Сортировка миграций",
             f"Первая миграция: {sorted_files[0]}\n"
@@ -147,17 +117,11 @@ def get_migration_files() -> List[str]:
 def check_migrations_table(session) -> None:
     """
     Проверяем наличие таблицы миграций и создаем если ее нет
-    
-    Аргументы:
-        session: SQLAlchemy сессия для работы с БД
-        
-    Исключения:
-        MigrationError: При ошибках создания таблицы или доступа к БД
     """
     try:
         _log_migration_step("Проверка таблицы applied_migrations")
         
-        # Проверка существования таблицы через information_schema
+        # Проверка существования таблица
         result = session.execute(text("""
             SELECT EXISTS (
                 SELECT FROM information_schema.tables 
@@ -173,7 +137,7 @@ def check_migrations_table(session) -> None:
 
         _log_migration_step("Создание таблиции applied_migrations")
         
-        # Создание таблицы с полем NAME_APP для multi-tenant поддержки
+        # Создание таблицы с полем NAME_APP
         create_table_sql = """
             CREATE TABLE applied_migrations (
                 id SERIAL PRIMARY KEY,
@@ -184,7 +148,7 @@ def check_migrations_table(session) -> None:
                 execution_time_ms FLOAT,
                 status VARCHAR(20) NOT NULL DEFAULT 'success',
                 error_message TEXT,
-                UNIQUE(name, name_app)  # Уникальность по имени миграции и приложения
+                UNIQUE(name, name_app)
             )
         """
         session.execute(text(create_table_sql))
@@ -206,16 +170,6 @@ def check_migrations_table(session) -> None:
 def get_applied_migrations(session, app_name: str) -> Dict[str, Tuple[str, float, str]]:
     """
     Получаем список примененных миграций для конкретного приложения
-    
-    Аргументы:
-        session: SQLAlchemy сессия
-        app_name: Имя приложения для фильтрации
-        
-    Возвращает:
-        Dict: Словарь с информацией о примененных миграциях (checksum, время, статус)
-        
-    Исключения:
-        MigrationError: При ошибках запроса к БД
     """
     try:
         _log_migration_step("Получение списка примененных миграций", f"Приложение: {app_name}")
@@ -252,22 +206,13 @@ def get_applied_migrations(session, app_name: str) -> Dict[str, Tuple[str, float
 def calculate_checksum(file_path: Path) -> str:
     """
     Вычисляем SHA-256 контрольную сумму файла миграции
-    
-    Аргументы:
-        file_path: Путь к файлу миграции
-        
-    Возвращает:
-        str: SHA-256 хеш содержимого файла
-        
-    Исключения:
-        MigrationError: При ошибках чтения файла или вычисления хеша
     """
     try:
         _log_migration_step("Вычисление контрольной суммы", f"Файл: {file_path.name}")
         
         with open(file_path, 'rb') as f:
             content = f.read()
-            checksum = hashlib.sha256(content).hexdigest()  # SHA-256 для целостности
+            checksum = hashlib.sha256(content).hexdigest()
             
         _log_migration_step(
             "Контрольная сумма вычислена",
@@ -286,24 +231,13 @@ def calculate_checksum(file_path: Path) -> str:
 def split_sql_statements(sql: str) -> List[str]:
     """
     Разбивает SQL-скрипт на отдельные запросы с поддержкой dollar-quoted строк.
-    
-    Аргументы:
-        sql: SQL-скрипт для разбора
-        
-    Возвращает:
-        List[str]: Список отдельных SQL-запросов
-        
-    Особенности:
-        - Игнорирует однострочные комментарии (--)
-        - Корректно обрабатывает dollar-quoted строки ($$tag$$content$$tag$$)
-        - Разделяет запросы по точкам с запятой вне строк и комментариев
     """
     _log_migration_step("Разбор SQL на отдельные запросы")
     
     statements = []
     current = ""
-    in_dollar_quote = False  # Флаг нахождения внутри dollar-quoted строки
-    dollar_tag = ""  # Текущий тег dollar-quoted строки
+    in_dollar_quote = False
+    dollar_tag = ""
     
     i = 0
     n = len(sql)
@@ -311,14 +245,14 @@ def split_sql_statements(sql: str) -> List[str]:
     while i < n:
         char = sql[i]
         
-        # Обработка комментариев (пропускаем однострочные комментарии)
+        # Обработка комментариев
         if not in_dollar_quote and char == '-' and i + 1 < n and sql[i+1] == '-':
-            # Пропускаем однострочный комментарий до конца строки
+            # Пропускаем однострочный комментарий
             while i < n and sql[i] != '\n':
                 i += 1
             continue
         
-        # Обработка dollar-quoted строк (начало)
+        # Обработка dollar-quoted строк
         if char == '$' and not in_dollar_quote:
             # Проверяем начало dollar-quoted строки
             j = i + 1
@@ -334,7 +268,6 @@ def split_sql_statements(sql: str) -> List[str]:
                 i = j + 1
                 continue
         
-        # Обработка dollar-quoted строк (конец)
         elif char == '$' and in_dollar_quote:
             # Проверяем конец dollar-quoted строки
             j = i + 1
@@ -349,7 +282,7 @@ def split_sql_statements(sql: str) -> List[str]:
                 i = j + 1
                 continue
         
-        # Если не в dollar-quoted строке, ищем точку с запятой для разделения запросов
+        # Если не в dollar-quoted строке, ищем точку с запятой
         if char == ';' and not in_dollar_quote:
             current += char
             if current.strip():
@@ -377,14 +310,6 @@ def apply_migration(session, migration_file: str, app_name: str) -> bool:
     """
     Применяет одну миграцию. Возвращает True если успешно, False если ошибка.
     В случае ошибки выполняется откат всех изменений этой миграции.
-    
-    Аргументы:
-        session: SQLAlchemy сессия
-        migration_file: Имя файла миграции
-        app_name: Имя приложения
-        
-    Возвращает:
-        bool: True если миграция успешно применена, False при ошибке
     """
     start_time = time.time()
     current_dir = Path(__file__).parent.parent
@@ -397,17 +322,17 @@ def apply_migration(session, migration_file: str, app_name: str) -> bool:
             f"Приложение: {app_name}"
         )
         
-        # Вычисление контрольной суммы для проверки целостности файла
+        # Вычисление контрольной суммы
         checksum = calculate_checksum(file_path)
         
         # Чтение SQL из файла
         with open(file_path, 'r', encoding='utf-8') as f:
             sql = f.read()
         
-        # Разбиение на отдельные запросы с поддержкой dollar-quoted строк
+        # Разбиение на отдельные запросы
         statements = split_sql_statements(sql)
         
-        # Выполнение каждого запроса в транзакции
+        # Выполнение каждого запроса
         for i, query in enumerate(statements, 1):
             query_start = time.time()
             try:
@@ -422,7 +347,7 @@ def apply_migration(session, migration_file: str, app_name: str) -> bool:
                 session.rollback()
                 raise
         
-        # Фиксация миграции в БД (запись в таблицу applied_migrations)
+        # Фиксация миграции в БД
         execution_time = (time.time() - start_time) * 1000
         session.execute(
             text("""
@@ -465,10 +390,10 @@ def apply_migration(session, migration_file: str, app_name: str) -> bool:
                 """),
                 {
                     "name": migration_file, 
-                    "app_name": app_name,
+                    "name_app": app_name,
                     "checksum": checksum,
                     "execution_time": execution_time,
-                    "error_message": str(e)[:1000]  # Ограничение длины сообщения об ошибке
+                    "error_message": str(e)[:1000]
                 }
             )
             session.commit()
@@ -483,13 +408,10 @@ def run_migrations() -> List[str]:
     """
     Выполняет все непримененные миграции по очереди.
     Если миграция завершается ошибкой, процесс останавливается и возвращается False.
-    
-    Возвращает:
-        List[str]: Список успешно примененных миграций
-        
-    Исключения:
-        MigrationError: При критических ошибках выполнения миграций
     """
+
+    global migration_complete
+
     total_start = time.time()
     applied_migrations = []
     
@@ -513,7 +435,7 @@ def run_migrations() -> List[str]:
             # Получение списка примененных и доступных миграций
             applied = set(get_applied_migrations(session, app_name).keys())
             all_files = set(get_migration_files())
-            pending = sorted(all_files - applied)  # Сортировка по имени
+            pending = sorted(all_files - applied)
             
             _log_migration_step(
                 "Статус миграций",
@@ -530,145 +452,98 @@ def run_migrations() -> List[str]:
                     "Все миграции уже применены",
                     "info"
                 )
-                # Устанавливаем флаг успешного завершения
-                global migration_complete
+                # Устанавливаем флаг завершения миграций
                 migration_complete = True
                 return []
             
-            # Применение каждой миграции по очереди
+            # Применение миграций по порядку
             for migration_file in pending:
-                try:
-                    success = apply_migration(session, migration_file, app_name)
-                    if success:
-                        applied_migrations.append(migration_file)
-                        _log_migration_step(
-                            "Миграция успешно завершена",
-                            f"Файл: {migration_file}\n"
-                            f"Переход к следующей миграции"
-                        )
-                    else:
-                        # Ошибка в миграции - останавливаем процесс
-                        error_msg = f"Миграция {migration_file} завершилась с ошибкой. Процесс остановлен."
-                        _log_migration_step("Остановка процесса", error_msg, "error")
-                        
-                        # Глобальный флаг остается False
-                        global migration_complete
-                        migration_complete = False
-                        
-                        return applied_migrations
-                        
-                except Exception as e:
-                    # Критическая ошибка - останавливаем процесс
-                    error_msg = f"Критическая ошибка в миграции {migration_file}: {str(e)}. Процесс остановлен."
+                success = apply_migration(session, migration_file, app_name)
+                if success:
+                    applied_migrations.append(migration_file)
+                else:
+                    error_msg = f"Миграция {migration_file} завершилась ошибкой. Процесс остановлен."
                     _log_migration_step("Критическая ошибка", error_msg, "critical")
-                    
-                    # Глобальный флаг остается False
-                    global migration_complete
-                    migration_complete = False
-                    
-                    return applied_migrations
-        
+                    raise MigrationError(error_msg, migration_file)
+            
+            # Если все миграции успешно применены
+            total_time = (time.time() - total_start) * 1000
+            _log_migration_step(
+                "Все миграции успешно применены",
+                f"Приложение: {app_name}\n"
+                f"Применено миграций: {len(applied_migrations)}\n"
+                f"Общее время: {total_time:.2f} мс\n"
+                f"Список примененных: {', '.join(applied_migrations)}"
+            )
+            
+            # Устанавливаем флаг завершения миграций
+            migration_complete = True
+            
+            return applied_migrations
+            
+    except Exception as e:
         total_time = (time.time() - total_start) * 1000
-        
-        # Все миграции успешно применены
         _log_migration_step(
-            "Все миграции успешно применены",
+            "Процесс миграций завершен с ошибкой",
             f"Приложение: {app_name}\n"
             f"Применено миграций: {len(applied_migrations)}\n"
-            f"Общее время выполнения: {total_time:.2f} мс"
+            f"Общее время: {total_time:.2f} мс\n"
+            f"Последняя ошибка: {str(e)}",
+            "critical"
         )
-        
-        # Устанавливаем флаг успешного завершения
-        global migration_complete
-        migration_complete = True
-        
-        return applied_migrations
-        
-    except Exception as e:
-        error_msg = f"Критическая ошибка выполнения миграций: {str(e)}"
-        _log_migration_step("Критическая ошибка", error_msg, "critical")
-        
-        # Глобальный флаг остается False
-        global migration_complete
-        migration_complete = False
-        
-        raise MigrationError(error_msg) from e
+        raise MigrationError(f"Процесс миграций завершен с ошибкой: {str(e)}") from e
 
-def is_migration_complete() -> bool:
+def check_migrations_status() -> Tuple[bool, str, List[str]]:
     """
-    Проверяет, завершены ли все миграции успешно
-    
-    Возвращает:
-        bool: True если все миграции успешно завершены, иначе False
-    """
-    global migration_complete
-    return migration_complete
-
-def check_migrations_status() -> Tuple[bool, List[str], List[str]]:
-    """
-    Проверяет состояние миграций без их выполнения
-    
-    Возвращает:
-        Tuple[bool, List[str], List[str]]: 
-            - Все миграции успешны
-            - Список ожидающих миграций
-            - Список миграций с ошибками
+    Проверяет статус миграций без их выполнения.
+    Возвращает кортеж: (все_миграции_применены, сообщение_статуса, список_непримененных_миграций)
     """
     try:
         app_name = get_app_name()
-        _log_migration_step("Проверка состояния миграций", f"Приложение: {app_name}")
         
         from maintenance.database_connector import get_db_connector
-        
         connector = get_db_connector()
         
         with connector.get_session() as session:
             check_migrations_table(session)
             
-            applied_migrations = get_applied_migrations(session, app_name)
+            applied = set(get_applied_migrations(session, app_name).keys())
             all_files = set(get_migration_files())
+            pending = sorted(all_files - applied)
             
-            # Разделяем успешные и ошибочные миграции
-            successful = [m for m, info in applied_migrations.items() if info[2] == 'success']
-            failed = [m for m, info in applied_migrations.items() if info[2] == 'error']
-            pending = sorted(all_files - set(applied_migrations.keys()))
-            
-            status_msg = (
-                f"Приложение: {app_name}\n"
-                f"Всего миграций: {len(all_files)}\n"
-                f"Успешно применено: {len(successful)}\n"
-                f"С ошибками: {len(failed)}\n"
-                f"Ожидает применения: {len(pending)}\n"
-                f"Ошибочные: {', '.join(failed) if failed else 'нет'}\n"
-                f"Ожидающие: {', '.join(pending) if pending else 'нет'}"
-            )
-            
-            if pending or failed:
-                _log_migration_step(
-                    "Обнаружены проблемы с миграциями", 
-                    status_msg,
-                    "warning" if pending else "error"
-                )
-                return (False, pending, failed)
-            
-            _log_migration_step(
-                "Все миграции успешно применены",
-                status_msg,
-                "info"
-            )
-            return (True, [], [])
-            
+            if not pending:
+                return (True, "Все миграции применены", [])
+            else:
+                return (False, f"Ожидают применения {len(pending)} миграций", pending)
+                
     except Exception as e:
-        error_msg = f"Ошибка проверки состояния миграций: {str(e)}"
-        _log_migration_step("Ошибка", error_msg, "error")
-        return (False, [], [])
+        error_msg = f"Ошибка проверки статуса миграций: {str(e)}"
+        logger.error(error_msg)
+        return (False, error_msg, [])
 
-def get_migration_status() -> Dict[str, any]:
+def is_migration_complete() -> bool:
+    """
+    Проверяет, завершены ли все миграции.
+    Использует глобальную переменную для кеширования результата.
+    """
+    global migration_complete
+
+    # Если уже установлен флаг завершения, возвращаем True
+    if migration_complete:
+        return True
+    
+    # Проверяем статус миграций
+    complete, message, pending = check_migrations_status()
+    
+    if complete:
+        migration_complete = True
+        return True
+    
+    return False
+
+def get_migration_status() -> Dict:
     """
     Возвращает детальный статус миграций в виде словаря
-    
-    Возвращает:
-        Dict: Детальная информация о состоянии миграций
     """
     try:
         app_name = get_app_name()
@@ -677,26 +552,43 @@ def get_migration_status() -> Dict[str, any]:
         connector = get_db_connector()
         
         with connector.get_session() as session:
-            applied_migrations = get_applied_migrations(session, app_name)
-            all_files = set(get_migration_files())
+            check_migrations_table(session)
             
-            successful = [m for m, info in applied_migrations.items() if info[2] == 'success']
-            failed = [m for m, info in applied_migrations.items() if info[2] == 'error']
-            pending = sorted(all_files - set(applied_migrations.keys()))
+            applied = get_applied_migrations(session, app_name)
+            all_files = set(get_migration_files())
+            pending = sorted(all_files - set(applied.keys()))
+            
+            # Получаем детальную информацию о примененных миграциях
+            applied_details = []
+            for migration in sorted(applied.keys()):
+                checksum, exec_time, status = applied[migration]
+                applied_details.append({
+                    'name': migration,
+                    'checksum': checksum,
+                    'execution_time_ms': exec_time,
+                    'status': status
+                })
             
             return {
-                "app_name": app_name,
-                "total_migrations": len(all_files),
-                "successful": successful,
-                "failed": failed,
-                "pending": pending,
-                "all_successful": len(pending) == 0 and len(failed) == 0,
-                "migration_complete": migration_complete
+                'app_name': app_name,
+                'total_migrations': len(all_files),
+                'applied_count': len(applied),
+                'pending_count': len(pending),
+                'pending_migrations': pending,
+                'applied_migrations': applied_details,
+                'all_complete': len(pending) == 0,
+                'has_errors': any(m[2] == 'error' for m in applied.values())
             }
             
     except Exception as e:
-        logger.error(f"Ошибка получения статуса миграций: {str(e)}")
         return {
-            "error": str(e),
-            "migration_complete": migration_complete
+            'app_name': 'unknown',
+            'total_migrations': 0,
+            'applied_count': 0,
+            'pending_count': 0,
+            'pending_migrations': [],
+            'applied_migrations': [],
+            'all_complete': False,
+            'has_errors': True,
+            'error': str(e)
         }

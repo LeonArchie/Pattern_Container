@@ -1,29 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH LICENSE-ADDITIONAL
 # Copyright (C) 2025 Петунин Лев Михайлович
 
-"""
-database_connector.py - Модуль для управления подключениями к базе данных PostgreSQL
-
-Этот модуль предоставляет комплексную систему для работы с базой данных:
-1. Управление пулом подключений через SQLAlchemy
-2. Обработка ошибок с детальным логированием
-3. Загрузка конфигурации из удаленного сервиса и локальных .env файлов
-4. Проверка здоровья подключения
-5. Ожидание подключения с экспоненциальной задержкой
-6. Контекстные менеджеры для безопасной работы с сессиями
-
-Основные компоненты:
-- DatabaseErrorHandler: обработчик ошибок БД с классификацией
-- DatabaseConnector: основной класс для управления подключениями
-- Глобальные функции: упрощенный интерфейс для работы с БД
-
-Особенности:
-- Использует пул соединений QueuePool для эффективного управления подключениями
-- Поддерживает повторные попытки подключения с экспоненциальной задержкой
-- Обеспечивает безопасное управление сессиями через контекстные менеджеры
-- Интегрируется с ConfigReader для получения параметров конфигурации
-"""
-
 import os
 import json
 import logging
@@ -48,75 +25,72 @@ from sqlalchemy.exc import (
 from contextlib import contextmanager
 
 # Загрузка переменных окружения из .env файла
-# Путь к .env файлу вычисляется относительно расположения этого модуля
 dotenv_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.env')
 load_dotenv(dotenv_path)
 
-# Импорт ConfigReader для получения параметров конфигурации
+# Импорт ConfigReader
 from maintenance.config_read import get_config_reader, read_config_param
 
-# Настройка логгера для этого модуля
+# Настройка логгера
 logger = logging.getLogger(__name__)
 
 class DatabaseErrorHandler:
     """Класс для обработки ошибок базы данных с детальным логированием."""
     
-    # Сопоставление типов ошибок SQLAlchemy с информацией для обработки
     ERROR_MAPPING = {
         OperationalError: {
             'code': 'db_connection_error',
             'message': "Ошибка подключения к базе данных",
             'log_level': logging.ERROR,
-            'retryable': True  # Можно повторить операцию
+            'retryable': True
         },
         DataError: {
             'code': 'db_data_error',
             'message': "Ошибка данных в запросе",
             'log_level': logging.WARNING,
-            'retryable': False  # Нельзя повторить (проблема с данными)
+            'retryable': False
         },
         IntegrityError: {
             'code': 'db_integrity_error',
             'message': "Нарушение целостности данных",
             'log_level': logging.WARNING,
-            'retryable': False  # Нельзя повторить (нарушение ограничений)
+            'retryable': False
         },
         ProgrammingError: {
             'code': 'db_programming_error',
             'message': "Ошибка в SQL запросе",
             'log_level': logging.ERROR,
-            'retryable': False  # Нельзя повторить (синтаксическая ошибка)
+            'retryable': False
         },
         InternalError: {
             'code': 'db_internal_error',
             'message': "Внутренняя ошибка базы данных",
             'log_level': logging.CRITICAL,
-            'retryable': True  # Можно повторить (временная проблема СУБД)
+            'retryable': True
         },
         InterfaceError: {
             'code': 'db_interface_error',
             'message': "Ошибка интерфейса базы данных",
             'log_level': logging.CRITICAL,
-            'retryable': True  # Можно повторить (проблема драйвера)
+            'retryable': True
         },
         TimeoutError: {
             'code': 'db_timeout_error',
             'message': "Таймаут операции с базой данных",
             'log_level': logging.WARNING,
-            'retryable': True  # Можно повторить (временная задержка)
+            'retryable': True
         },
         DatabaseError: {
             'code': 'db_generic_error',
             'message': "Ошибка базы данных",
             'log_level': logging.ERROR,
-            'retryable': False  # Общая ошибка, нельзя повторить
+            'retryable': False
         }
     }
     
     @classmethod
     def handle_error(cls, error: SQLAlchemyError, context: Optional[Dict[str, Any]] = None) -> None:
         """Обработка ошибки базы данных с детальным логированием контекста."""
-        # Определение типа ошибки и получение соответствующей информации
         error_type = type(error)
         error_info = cls.ERROR_MAPPING.get(error_type, {
             'code': 'db_unknown_error',
@@ -133,20 +107,17 @@ class DatabaseErrorHandler:
             f"Можно повторить: {'Да' if error_info['retryable'] else 'Нет'}"
         ]
         
-        # Добавление контекстной информации, если предоставлена
         if context:
             error_details.append("Контекст ошибки:")
             for key, value in context.items():
                 error_details.append(f"  {key}: {value}")
         
-        # Логирование ошибки с соответствующим уровнем
         logger.log(
             error_info['log_level'],
             "\n".join(error_details),
-            exc_info=True  # Включение traceback в лог
+            exc_info=True
         )
         
-        # Преобразование SQLAlchemy ошибки в RuntimeError для единообразной обработки
         raise RuntimeError(f"{error_info['message']} (код: {error_info['code']})") from error
 
 class DatabaseConnector:
@@ -154,20 +125,18 @@ class DatabaseConnector:
     
     def __init__(self):
         """Инициализация коннектора к базе данных."""
-        self.engine = None  # SQLAlchemy engine для управления подключениями
-        self.SessionLocal = None  # Фабрика сессий
-        self.Base = declarative_base()  # Базовый класс для ORM моделей
-        self._initialized = False  # Флаг инициализации
-        self.config = {}  # Конфигурационные параметры
+        self.engine = None
+        self.SessionLocal = None
+        self.Base = declarative_base()
+        self._initialized = False
+        self.config = {}
         
         logger.info("Инициализация DatabaseConnector")
     
     def _log_db_operation(self, operation: str, details: str = "", level: str = "info") -> None:
         """Унифицированное логирование операций с БД."""
-        # Получение метода логирования по имени
         log_method = getattr(logger, level.lower(), logger.info)
         border = "=" * 60
-        # Форматированное логирование с разделителями
         log_method(f"\n{border}\nOPERATION: {operation}\n{details}\n{border}")
     
     def _get_config_param_with_retry(self, file_name: str, param_path: str, max_retries: int = 10, retry_delay: float = 5.0) -> Any:
@@ -183,7 +152,6 @@ class DatabaseConnector:
         """
         for attempt in range(1, max_retries + 1):
             try:
-                # Попытка чтения параметра конфигурации
                 value = read_config_param(file_name, param_path)
                 if value is not None:
                     logger.info(f"Параметр {param_path} успешно получен: {value}")
@@ -193,12 +161,10 @@ class DatabaseConnector:
             except Exception as e:
                 logger.warning(f"Ошибка получения параметра {param_path} (попытка {attempt}/{max_retries}): {str(e)}")
             
-            # Задержка перед следующей попыткой (кроме последней)
             if attempt < max_retries:
                 logger.info(f"Повторная попытка получения параметра {param_path} через {retry_delay} сек")
                 time.sleep(retry_delay)
         
-        # Все попытки исчерпаны - возбуждение исключения
         error_msg = f"Не удалось получить параметр {param_path} после {max_retries} попыток"
         logger.error(error_msg)
         raise RuntimeError(error_msg)
@@ -208,7 +174,7 @@ class DatabaseConnector:
         self._log_db_operation("Загрузка конфигурации БД")
         
         try:
-            # Словарь параметров конфигурации и их путей в ConfigReader
+            # Загрузка конфигурации из ConfigReader с повторными попытками
             config_params = {
                 'master_host': ('db', 'master_host'),
                 'master_port': ('db', 'master_port'),
@@ -223,17 +189,15 @@ class DatabaseConnector:
                 'retry_delay': ('db', 'retry_delay')
             }
             
-            # Последовательная загрузка всех параметров конфигурации
             for key, (file_name, param_path) in config_params.items():
                 value = self._get_config_param_with_retry(file_name, param_path)
                 self.config[key] = value
                 logger.info(f"Конфигурация {key}: {value}")
             
-            # Загрузка учетных данных из переменных окружения (.env файл)
+            # Загрузка учетных данных из .env
             self.config['user'] = os.getenv('DATABASE_USER')
             self.config['password'] = os.getenv('DB_PASSWORD')
             
-            # Проверка наличия обязательных учетных данных
             if not self.config['user']:
                 raise ValueError("Не найден DATABASE_USER в .env файле")
             if not self.config['password']:
@@ -241,14 +205,12 @@ class DatabaseConnector:
                 
             logger.info("Учетные данные успешно загружены из .env")
             
-            # Детальное логирование загруженной конфигурации (без пароля)
             self._log_db_operation(
                 "Конфигурация загружена",
                 f"Параметры:\n{json.dumps({k: v for k, v in self.config.items() if k != 'password'}, indent=2, default=str)}"
             )
             
         except Exception as e:
-            # Логирование ошибки загрузки конфигурации
             self._log_db_operation(
                 "Ошибка загрузки конфигурации",
                 f"Тип ошибки: {type(e).__name__}\nСообщение: {str(e)}",
@@ -266,7 +228,6 @@ class DatabaseConnector:
             f"Пользователь: {self.config['user']}"
         )
         
-        # Формирование DSN строки для подключения к PostgreSQL
         return (
             f"postgresql://{self.config['user']}:{self.config['password']}@"
             f"{self.config['master_host']}:{self.config['master_port']}/"
@@ -275,7 +236,6 @@ class DatabaseConnector:
     
     def initialize(self) -> None:
         """Инициализация подключения к базе данных."""
-        # Проверка повторной инициализации
         if self._initialized:
             self._log_db_operation(
                 "Повторная инициализация БД",
@@ -294,25 +254,25 @@ class DatabaseConnector:
             connection_string = self._get_connection_string()
             logger.debug(f"Полная строка подключения: {connection_string}")
             
-            # Создание engine с пулом подключений
+            # Создание engine
             self._log_db_operation("Создание engine БД")
             self.engine = create_engine(
                 connection_string,
-                poolclass=QueuePool,  # Использование пула соединений
-                pool_size=int(self.config['pool_size']),  # Размер пула
-                max_overflow=int(self.config['max_overflow']),  # Максимальное переполнение
-                pool_timeout=int(self.config['pool_timeout']),  # Таймаут ожидания соединения
-                pool_recycle=int(self.config['pool_recycle']),  # Время пересоздания соединения
-                pool_pre_ping=bool(self.config['pool_pre_ping']),  # Проверка соединения перед использованием
-                pool_use_lifo=bool(self.config['pool_use_lifo']),  # Использование LIFO для пула
-                echo=False,  # Отключение SQL логгирования
+                poolclass=QueuePool,
+                pool_size=int(self.config['pool_size']),
+                max_overflow=int(self.config['max_overflow']),
+                pool_timeout=int(self.config['pool_timeout']),
+                pool_recycle=int(self.config['pool_recycle']),
+                pool_pre_ping=bool(self.config['pool_pre_ping']),
+                pool_use_lifo=bool(self.config['pool_use_lifo']),
+                echo=False,
                 connect_args={
-                    'connect_timeout': 5,  # Таймаут подключения
-                    'application_name': 'EOS_App'  # Идентификатор приложения
+                    'connect_timeout': 5,
+                    'application_name': 'EOS_App'
                 }
             )
             
-            # Проверка подключения выполнение тестового запроса
+            # Проверка подключения
             self._log_db_operation("Проверка подключения к БД")
             test_start = time.time()
             with self.engine.connect() as conn:
@@ -327,7 +287,7 @@ class DatabaseConnector:
                     f"Версия СУБД: {row[1]}"
                 )
             
-            # Инициализация фабрики сессий
+            # Инициализация сессий
             self._log_db_operation("Инициализация сессий БД")
             self.SessionLocal = scoped_session(
                 sessionmaker(
@@ -338,7 +298,6 @@ class DatabaseConnector:
                 )
             )
             
-            # Установка флага успешной инициализации
             self._initialized = True
             init_time = (time.time() - start_time) * 1000
             self._log_db_operation(
@@ -349,7 +308,6 @@ class DatabaseConnector:
             )
             
         except Exception as e:
-            # Обработка ошибок инициализации
             init_time = (time.time() - start_time) * 1000
             self._log_db_operation(
                 "Ошибка инициализации БД",
@@ -357,7 +315,6 @@ class DatabaseConnector:
                 f"Тип ошибки: {type(e).__name__}",
                 "critical"
             )
-            # Освобождение ресурсов при ошибке
             if self.engine:
                 self.engine.dispose()
             raise
@@ -396,22 +353,18 @@ class DatabaseConnector:
             logger.error(error_msg)
             raise RuntimeError(error_msg)
         
-        # Создание новой сессии
         session = self.SessionLocal()
         session_id = id(session)
         
         try:
             logger.info(f"Открытие сессии БД (ID: {session_id})")
             
-            # Возврат сессии в контекст
             yield session
             
-            # Коммит изменений при успешном выполнении
             session.commit()
             logger.info(f"Сессия БД успешно завершена (ID: {session_id})")
             
         except SQLAlchemyError as e:
-            # Откат изменений при ошибках БД
             session.rollback()
             DatabaseErrorHandler.handle_error(e, {
                 'session_id': session_id,
@@ -419,7 +372,6 @@ class DatabaseConnector:
             })
             
         except Exception as e:
-            # Откат изменений при других ошибках
             session.rollback()
             logger.error(
                 f"Неожиданная ошибка в сессии {session_id}: {str(e)}",
@@ -428,7 +380,6 @@ class DatabaseConnector:
             raise RuntimeError("Неожиданная ошибка при работе с БД") from e
             
         finally:
-            # Гарантированное закрытие сессии
             session.close()
             if self.SessionLocal.registry.has():
                 self.SessionLocal.remove()
@@ -444,7 +395,6 @@ class DatabaseConnector:
             )
             return
         
-        # Логирование текущего состояния пула
         self._log_db_operation(
             "Начало закрытия пула подключений",
             f"Текущий размер пула: {self.engine.pool.size()}\n"
@@ -453,7 +403,6 @@ class DatabaseConnector:
         
         start_time = time.time()
         try:
-            # Освобождение всех соединений пула
             self.engine.dispose()
             self._initialized = False
             
@@ -473,7 +422,7 @@ class DatabaseConnector:
         """Проверка инициализации подключения к БД."""
         return self._initialized
 
-# Глобальный экземпляр для реализации синглтон-паттерна
+# Глобальный экземпляр для удобства использования
 _db_connector = None
 
 def get_db_connector() -> DatabaseConnector:
@@ -531,7 +480,6 @@ def wait_for_database_connection(max_retries: int = 10, retry_delay: float = 5.0
         try:
             logger.info(f"Попытка подключения {attempt}/{max_retries}")
             
-            # Инициализация подключения если еще не инициализировано
             if not connector.is_initialized():
                 connector.initialize()
             
@@ -544,15 +492,14 @@ def wait_for_database_connection(max_retries: int = 10, retry_delay: float = 5.0
         except Exception as e:
             logger.warning(f"Ошибка подключения к БД (попытка {attempt}): {str(e)}")
             
-            # Экспоненциальная задержка перед следующей попыткой
             if attempt < max_retries:
+                # Экспоненциальная задержка
                 current_delay = retry_delay * (1.5 ** (attempt - 1))
                 current_delay = min(current_delay, 30)  # Максимальная задержка 30 сек
                 
                 logger.info(f"Повторная попытка через {current_delay:.1f} сек")
                 time.sleep(current_delay)
     
-    # Все попытки исчерпаны
     total_time = time.time() - start_time
     logger.error(f"Не удалось подключиться к БД после {max_retries} попыток за {total_time:.2f} сек")
     return False
