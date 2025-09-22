@@ -1,6 +1,10 @@
 -- SPDX-License-Identifier: AGPL-3.0-only WITH LICENSE-ADDITIONAL
 -- Copyright (C) 2025 Петунин Лев Михайлович
 
+-- НЕ ЗАБЫВАТЬ ВЫДАТЬ ПРАВА ВСЕМ ПОЛЬЗОВАТЕЛЯМ КОТОРЫМ ОНИ НУЖНЫ 
+--И DB_ADMIN
+
+
 -- Создание таблицы пользователей
 CREATE TABLE users (
     user_id UUID PRIMARY KEY,
@@ -9,6 +13,11 @@ CREATE TABLE users (
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
 );
+
+GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER 
+ON TABLE users TO "DB_ADMIN";
+GRANT ALL PRIVILEGES ON users TO "DB_ADMIN";
+
 
 -- Комментарии к таблице users
 COMMENT ON TABLE users IS 'Основная таблица для хранения информации о пользователях системы';
@@ -32,6 +41,11 @@ CREATE TABLE sessions (
     is_revoked BOOLEAN NOT NULL DEFAULT FALSE,
     last_used_at TIMESTAMP WITH TIME ZONE
 );
+
+GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER 
+ON TABLE sessions TO "DB_ADMIN";
+GRANT ALL PRIVILEGES ON sessions TO "DB_ADMIN";
+
 
 -- Комментарии к таблице sessions
 COMMENT ON TABLE sessions IS 'Таблица для хранения активных сессий пользователей';
