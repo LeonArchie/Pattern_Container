@@ -5,16 +5,25 @@ import os
 import re
 import hashlib
 import time
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Callable, Any
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 import logging
 from pathlib import Path
+from functools import wraps
 
 logger = logging.getLogger(__name__)
 
 # Глобальная переменная для отслеживания статуса миграций
 migration_complete = False
+
+# Глобальные переменные для кэширования статуса миграций
+migration_status_cache = {
+    'complete': False,      # Все миграции успешно применены
+    'checked': False,       # Статус был проверен
+    'has_errors': False,    # Есть миграции с ошибками
+    'pending_count': 0      # Количество ожидающих миграций
+}
 
 class MigrationError(Exception):
     """Класс для ошибок миграции с детальным логированием"""
@@ -27,11 +36,65 @@ class MigrationError(Exception):
         )
         super().__init__(message)
 
+# ==================== ДЕКОРАТОРЫ И ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
+
+def with_db_session(func: Callable) -> Callable:
+    """Декоратор для автоматического получения сессии БД"""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        from maintenance.database_connector import get_db_connector
+        connector = get_db_connector()
+        with connector.get_session() as session:
+            return func(session, *args, **kwargs)
+    return wrapper
+
 def _log_migration_step(step: str, details: str = "", level: str = "info") -> None:
     """Унифицированное логирование шагов миграции"""
     log_method = getattr(logger, level.lower(), logger.info)
     border = "=" * 40
     log_method(f"\n{border}\nМИГРАЦИЯ: {step}\n{details}\n{border}")
+
+def _get_pending_migrations(applied: Dict, all_files: set) -> List[str]:
+    """Получить список ожидающих миграций (не примененные или с ошибками)"""
+    pending = []
+    for migration_file in sorted(all_files):
+        if migration_file not in applied:
+            pending.append(migration_file)
+        elif (migration_file in applied and 
+              applied[migration_file][2] == 'error'):
+            pending.append(migration_file)
+    return pending
+
+def _update_migration_cache(complete: bool, has_errors: bool, pending_count: int) -> None:
+    """Обновить кэш статуса миграций"""
+    global migration_status_cache
+    migration_status_cache = {
+        'complete': complete,
+        'checked': True,
+        'has_errors': has_errors,
+        'pending_count': pending_count
+    }
+
+def _get_migration_status_data(session) -> Dict[str, Any]:
+    """Базовая функция для получения данных о статусе миграций"""
+    app_name = get_app_name()
+    check_migrations_table(session)
+    applied = get_applied_migrations(session, app_name)
+    all_files = set(get_migration_files())
+    pending = _get_pending_migrations(applied, all_files)
+    has_errors = any(m[2] == 'error' for m in applied.values())
+    
+    return {
+        'app_name': app_name,
+        'applied': applied,
+        'all_files': all_files,
+        'pending': pending,
+        'has_errors': has_errors,
+        'pending_count': len(pending),
+        'complete': len(pending) == 0 and not has_errors
+    }
+
+# ==================== ОСНОВНЫЕ ФУНКЦИИ ====================
 
 def get_app_name() -> str:
     """
@@ -310,6 +373,7 @@ def apply_migration(session, migration_file: str, app_name: str) -> bool:
     """
     Применяет одну миграцию. Возвращает True если успешно, False если ошибка.
     В случае ошибки выполняется откат всех изменений этой миграции.
+    Если миграция уже была применена с ошибкой, выполняется повторная попытка.
     """
     start_time = time.time()
     current_dir = Path(__file__).parent.parent
@@ -324,6 +388,26 @@ def apply_migration(session, migration_file: str, app_name: str) -> bool:
         
         # Вычисление контрольной суммы
         checksum = calculate_checksum(file_path)
+        
+        # Проверяем, существует ли уже запись о миграции (включая статус error)
+        existing_migration = session.execute(
+            text("""
+                SELECT status, checksum 
+                FROM applied_migrations 
+                WHERE name = :name AND name_app = :name_app
+            """),
+            {"name": migration_file, "name_app": app_name}
+        ).fetchone()
+        
+        # Если миграция уже существует со статусом error, выполняем UPDATE вместо INSERT
+        is_retry = existing_migration and existing_migration[0] == 'error'
+        
+        if is_retry:
+            _log_migration_step(
+                "Повторное применение миграции",
+                f"Миграция {migration_file} ранее завершилась ошибкой\n"
+                f"Выполняется повторная попытка применения"
+            )
         
         # Чтение SQL из файла
         with open(file_path, 'r', encoding='utf-8') as f:
@@ -349,30 +433,60 @@ def apply_migration(session, migration_file: str, app_name: str) -> bool:
         
         # Фиксация миграции в БД
         execution_time = (time.time() - start_time) * 1000
-        session.execute(
-            text("""
-                INSERT INTO applied_migrations 
-                (name, name_app, checksum, execution_time_ms, status) 
-                VALUES (:name, :name_app, :checksum, :execution_time, 'success')
-            """),
-            {
-                "name": migration_file, 
-                "name_app": app_name,
-                "checksum": checksum,
-                "execution_time": execution_time
-            }
-        )
+        
+        if is_retry:
+            # Обновляем существующую запись
+            session.execute(
+                text("""
+                    UPDATE applied_migrations 
+                    SET checksum = :checksum, 
+                        execution_time_ms = :execution_time,
+                        status = 'success',
+                        error_message = NULL,
+                        applied_at = NOW()
+                    WHERE name = :name AND name_app = :name_app
+                """),
+                {
+                    "name": migration_file, 
+                    "name_app": app_name,
+                    "checksum": checksum,
+                    "execution_time": execution_time
+                }
+            )
+            _log_migration_step(
+                "Миграция успешно переприменена",
+                f"Файл: {migration_file}\n"
+                f"Приложение: {app_name}\n"
+                f"Статус изменен с 'error' на 'success'\n"
+                f"Контрольная сумма: {checksum}\n"
+                f"Время выполнения: {execution_time:.2f} мс\n"
+                f"Выполнено запросов: {len(statements)}"
+            )
+        else:
+            # Создаем новую запись
+            session.execute(
+                text("""
+                    INSERT INTO applied_migrations 
+                    (name, name_app, checksum, execution_time_ms, status) 
+                    VALUES (:name, :name_app, :checksum, :execution_time, 'success')
+                """),
+                {
+                    "name": migration_file, 
+                    "name_app": app_name,
+                    "checksum": checksum,
+                    "execution_time": execution_time
+                }
+            )
+            _log_migration_step(
+                "Миграция успешно применена",
+                f"Файл: {migration_file}\n"
+                f"Приложение: {app_name}\n"
+                f"Контрольная сумма: {checksum}\n"
+                f"Время выполнения: {execution_time:.2f} мс\n"
+                f"Выполнено запросов: {len(statements)}"
+            )
+        
         session.commit()
-        
-        _log_migration_step(
-            "Миграция успешно применена",
-            f"Файл: {migration_file}\n"
-            f"Приложение: {app_name}\n"
-            f"Контрольная сумма: {checksum}\n"
-            f"Время выполнения: {execution_time:.2f} мс\n"
-            f"Выполнено запросов: {len(statements)}"
-        )
-        
         return True
         
     except Exception as e:
@@ -382,20 +496,43 @@ def apply_migration(session, migration_file: str, app_name: str) -> bool:
         # Записываем информацию об ошибке в БД (в отдельной транзакции)
         try:
             execution_time = (time.time() - start_time) * 1000
-            session.execute(
-                text("""
-                    INSERT INTO applied_migrations 
-                    (name, name_app, checksum, execution_time_ms, status, error_message) 
-                    VALUES (:name, :name_app, :checksum, :execution_time, 'error', :error_message)
-                """),
-                {
-                    "name": migration_file, 
-                    "name_app": app_name,
-                    "checksum": checksum,
-                    "execution_time": execution_time,
-                    "error_message": str(e)[:1000]
-                }
-            )
+            
+            if existing_migration:
+                # Обновляем существующую запись об ошибке
+                session.execute(
+                    text("""
+                        UPDATE applied_migrations 
+                        SET checksum = :checksum, 
+                            execution_time_ms = :execution_time,
+                            status = 'error',
+                            error_message = :error_message,
+                            applied_at = NOW()
+                        WHERE name = :name AND name_app = :name_app
+                    """),
+                    {
+                        "name": migration_file, 
+                        "name_app": app_name,
+                        "checksum": checksum,
+                        "execution_time": execution_time,
+                        "error_message": str(e)[:1000]
+                    }
+                )
+            else:
+                # Создаем новую запись об ошибке
+                session.execute(
+                    text("""
+                        INSERT INTO applied_migrations 
+                        (name, name_app, checksum, execution_time_ms, status, error_message) 
+                        VALUES (:name, :name_app, :checksum, :execution_time, 'error', :error_message)
+                    """),
+                    {
+                        "name": migration_file, 
+                        "name_app": app_name,
+                        "checksum": checksum,
+                        "execution_time": execution_time,
+                        "error_message": str(e)[:1000]
+                    }
+                )
             session.commit()
         except Exception as db_error:
             logger.error(f"Ошибка записи информации об ошибке миграции: {db_error}")
@@ -404,182 +541,211 @@ def apply_migration(session, migration_file: str, app_name: str) -> bool:
         _log_migration_step("Ошибка", error_msg, "error")
         return False
 
-def run_migrations() -> List[str]:
+@with_db_session
+def run_migrations(session) -> List[str]:
     """
     Выполняет все непримененные миграции по очереди.
-    Если миграция завершается ошибкой, процесс останавливается и возвращается False.
     """
-
-    global migration_complete
-
+    global migration_status_cache
+    
+    # Если кэш установлен и миграции завершены, ничего не делаем
+    if migration_status_cache['checked'] and migration_status_cache['complete']:
+        logger.debug("Миграции уже завершены (кэш), пропускаем выполнение")
+        return []
+    
     total_start = time.time()
     applied_migrations = []
     
     try:
-        app_name = get_app_name()
+        status_data = _get_migration_status_data(session)
+        app_name = status_data['app_name']
+        pending = status_data['pending']
         
         _log_migration_step(
             "Запуск процесса миграций",
             f"Приложение: {app_name}\n"
-            f"Стратегия: Остановка при первой ошибке"
+            f"Стратегия: Остановка при первой ошибкой\n"
+            f"Повторное применение миграций с ошибками"
         )
         
-        from maintenance.database_connector import get_db_connector
-        
-        connector = get_db_connector()
-        
-        with connector.get_session() as session:
-            # Проверка и создание таблицы миграций
-            check_migrations_table(session)
-            
-            # Получение списка примененных и доступных миграций
-            applied = set(get_applied_migrations(session, app_name).keys())
-            all_files = set(get_migration_files())
-            pending = sorted(all_files - applied)
-            
+        if not pending:
             _log_migration_step(
-                "Статус миграций",
-                f"Приложение: {app_name}\n"
-                f"Всего миграций доступно: {len(all_files)}\n"
-                f"Уже применено: {len(applied)}\n"
-                f"Ожидает применения: {len(pending)}\n"
-                f"Список ожидающих: {', '.join(pending) if pending else 'нет'}"
+                "Нет новых миграций",
+                "Все миграции уже применены успешно",
+                "info"
             )
-            
-            if not pending:
+            _update_migration_cache(complete=True, has_errors=False, pending_count=0)
+            logger.debug("Миграции завершены, кэш обновлен")
+            return []
+        
+        # Применение миграций по порядку
+        for migration_file in pending:
+            # Логируем тип применения (новая миграция или повторная)
+            if migration_file in status_data['applied']:
+                prev_status = status_data['applied'][migration_file][2]
                 _log_migration_step(
-                    "Нет новых миграций",
-                    "Все миграции уже применены",
-                    "info"
+                    "Повторное применение миграции",
+                    f"Миграция: {migration_file}\n"
+                    f"Предыдущий статус: {prev_status}"
                 )
-                # Устанавливаем флаг завершения миграций
-                migration_complete = True
-                return []
+            else:
+                _log_migration_step(
+                    "Первое применение миграции",
+                    f"Миграция: {migration_file}"
+                )
             
-            # Применение миграций по порядку
-            for migration_file in pending:
-                success = apply_migration(session, migration_file, app_name)
-                if success:
-                    applied_migrations.append(migration_file)
-                else:
-                    error_msg = f"Миграция {migration_file} завершилась ошибкой. Процесс остановлен."
-                    _log_migration_step("Критическая ошибка", error_msg, "critical")
-                    raise MigrationError(error_msg, migration_file)
-            
-            # Если все миграции успешно применены
-            total_time = (time.time() - total_start) * 1000
-            _log_migration_step(
-                "Все миграции успешно применены",
-                f"Приложение: {app_name}\n"
-                f"Применено миграций: {len(applied_migrations)}\n"
-                f"Общее время: {total_time:.2f} мс\n"
-                f"Список примененных: {', '.join(applied_migrations)}"
-            )
-            
-            # Устанавливаем флаг завершения миграций
-            migration_complete = True
-            
-            return applied_migrations
-            
+            success = apply_migration(session, migration_file, app_name)
+            if success:
+                applied_migrations.append(migration_file)
+            else:
+                error_msg = f"Миграция {migration_file} завершилась ошибкой. Процесс остановлен."
+                _log_migration_step("Критическая ошибка", error_msg, "critical")
+                
+                # Обновляем кэш с информацией об ошибке
+                remaining_pending = len(pending) - len(applied_migrations)
+                _update_migration_cache(complete=False, has_errors=True, pending_count=remaining_pending)
+                
+                raise MigrationError(error_msg, migration_file)
+        
+        # Если все миграции успешно применены
+        total_time = (time.time() - total_start) * 1000
+        _update_migration_cache(complete=True, has_errors=False, pending_count=0)
+        
+        _log_migration_step(
+            "Все миграции успешно применены",
+            f"Приложение: {app_name}\n"
+            f"Кэш миграций обновлен\n"
+            f"Применено в этой сессии: {len(applied_migrations)}\n"
+            f"Общее время: {total_time:.2f} мс"
+        )
+        
+        return applied_migrations
+        
     except Exception as e:
         total_time = (time.time() - total_start) * 1000
         _log_migration_step(
             "Процесс миграций завершен с ошибкой",
-            f"Приложение: {app_name}\n"
-            f"Применено миграций: {len(applied_migrations)}\n"
+            f"Применено миграций в сессии: {len(applied_migrations)}\n"
             f"Общее время: {total_time:.2f} мс\n"
-            f"Последняя ошибка: {str(e)}",
+            f"Кэш миграций обновлен с информацией об ошибке",
             "critical"
         )
         raise MigrationError(f"Процесс миграций завершен с ошибкой: {str(e)}") from e
 
-def check_migrations_status() -> Tuple[bool, str, List[str]]:
+@with_db_session
+def check_migrations_status(session) -> Tuple[bool, str, List[str]]:
     """
     Проверяет статус миграций без их выполнения.
-    Возвращает кортеж: (все_миграции_применены, сообщение_статуса, список_непримененных_миграций)
+    Использует кэш для избежания лишних запросов к БД.
     """
-    try:
-        app_name = get_app_name()
+    global migration_status_cache
+    
+    # Если статус уже проверен, возвращаем результат из кэша
+    if migration_status_cache['checked']:
+        pending_count = migration_status_cache['pending_count']
+        has_errors = migration_status_cache['has_errors']
         
-        from maintenance.database_connector import get_db_connector
-        connector = get_db_connector()
-        
-        with connector.get_session() as session:
-            check_migrations_table(session)
-            
-            applied = set(get_applied_migrations(session, app_name).keys())
-            all_files = set(get_migration_files())
-            pending = sorted(all_files - applied)
-            
-            if not pending:
-                return (True, "Все миграции применены", [])
+        if pending_count == 0:
+            if not has_errors:
+                return (True, "Все миграции применены успешно (кэш)", [])
             else:
-                return (False, f"Ожидают применения {len(pending)} миграций", pending)
-                
+                return (False, "Миграции завершены с ошибками (кэш)", [])
+        else:
+            return (False, f"Ожидают применения {pending_count} миграций (кэш)", [])
+    
+    try:
+        status_data = _get_migration_status_data(session)
+        pending = status_data['pending']
+        has_errors = status_data['has_errors']
+        
+        # Обновляем кэш
+        _update_migration_cache(
+            complete=status_data['complete'],
+            has_errors=has_errors,
+            pending_count=len(pending)
+        )
+        
+        if len(pending) == 0:
+            if not has_errors:
+                return (True, "Все миграции применены успешно", [])
+            else:
+                return (False, "Миграции завершены с ошибками", [])
+        else:
+            error_count = sum(1 for _, _, status in status_data['applied'].values() if status == 'error')
+            success_count = sum(1 for _, _, status in status_data['applied'].values() if status == 'success')
+            
+            return (False, f"Ожидают применения {len(pending)} миграций (успешных: {success_count}, с ошибками: {error_count})", pending)
+            
     except Exception as e:
         error_msg = f"Ошибка проверки статуса миграций: {str(e)}"
         logger.error(error_msg)
+        # В случае ошибки не кэшируем результат
         return (False, error_msg, [])
 
-def is_migration_complete() -> bool:
+@with_db_session
+def is_migration_complete(session) -> bool:
     """
     Проверяет, завершены ли все миграции.
-    Использует глобальную переменную для кеширования результата.
+    Использует кэш для избежания лишних запросов к БД.
     """
-    global migration_complete
+    global migration_status_cache
+    
+    # Если статус уже проверен и нет ожидающих миграций, возвращаем результат из кэша
+    if migration_status_cache['checked'] and migration_status_cache['pending_count'] == 0:
+        logger.debug(f"Используется кэш миграций: complete={migration_status_cache['complete']}, has_errors={migration_status_cache['has_errors']}")
+        return migration_status_cache['complete'] and not migration_status_cache['has_errors']
+    
+    try:
+        status_data = _get_migration_status_data(session)
+        complete = status_data['complete']
+        
+        # Обновляем кэш
+        _update_migration_cache(
+            complete=complete,
+            has_errors=status_data['has_errors'],
+            pending_count=status_data['pending_count']
+        )
+        
+        logger.debug(f"Статус миграций обновлен в кэше: complete={complete}, has_errors={status_data['has_errors']}, pending_count={status_data['pending_count']}")
+        
+        return complete
+        
+    except Exception as e:
+        logger.error(f"Ошибка проверки статуса миграций: {str(e)}")
+        # В случае ошибки не кэшируем результат, чтобы попробовать снова
+        return False
 
-    # Если уже установлен флаг завершения, возвращаем True
-    if migration_complete:
-        return True
-    
-    # Проверяем статус миграций
-    complete, message, pending = check_migrations_status()
-    
-    if complete:
-        migration_complete = True
-        return True
-    
-    return False
-
-def get_migration_status() -> Dict:
+@with_db_session
+def get_migration_status(session) -> Dict:
     """
     Возвращает детальный статус миграций в виде словаря
     """
     try:
-        app_name = get_app_name()
+        status_data = _get_migration_status_data(session)
+        applied = status_data['applied']
         
-        from maintenance.database_connector import get_db_connector
-        connector = get_db_connector()
+        # Получаем детальную информацию о примененных миграциях
+        applied_details = []
+        for migration in sorted(applied.keys()):
+            checksum, exec_time, status = applied[migration]
+            applied_details.append({
+                'name': migration,
+                'checksum': checksum,
+                'execution_time_ms': exec_time,
+                'status': status
+            })
         
-        with connector.get_session() as session:
-            check_migrations_table(session)
-            
-            applied = get_applied_migrations(session, app_name)
-            all_files = set(get_migration_files())
-            pending = sorted(all_files - set(applied.keys()))
-            
-            # Получаем детальную информацию о примененных миграциях
-            applied_details = []
-            for migration in sorted(applied.keys()):
-                checksum, exec_time, status = applied[migration]
-                applied_details.append({
-                    'name': migration,
-                    'checksum': checksum,
-                    'execution_time_ms': exec_time,
-                    'status': status
-                })
-            
-            return {
-                'app_name': app_name,
-                'total_migrations': len(all_files),
-                'applied_count': len(applied),
-                'pending_count': len(pending),
-                'pending_migrations': pending,
-                'applied_migrations': applied_details,
-                'all_complete': len(pending) == 0,
-                'has_errors': any(m[2] == 'error' for m in applied.values())
-            }
-            
+        return {
+            'app_name': status_data['app_name'],
+            'total_migrations': len(status_data['all_files']),
+            'applied_count': len(applied),
+            'pending_count': status_data['pending_count'],
+            'pending_migrations': status_data['pending'],
+            'applied_migrations': applied_details,
+            'all_complete': status_data['complete'],
+            'has_errors': status_data['has_errors']
+        }
+        
     except Exception as e:
         return {
             'app_name': 'unknown',

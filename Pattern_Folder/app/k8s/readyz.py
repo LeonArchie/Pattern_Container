@@ -59,18 +59,16 @@ def _check_migrations_status():
     Проверка статуса миграций базы данных
     """
     try:
-        if is_migration_complete():
-            logger.debug("Миграции базы данных завершены")
+        # Используем только одну функцию для проверки
+        migrations_complete, status_message, pending_migrations = check_migrations_status()
+        
+        if migrations_complete:
+            logger.debug(f"Миграции базы данных завершены: {status_message}")
             return True
         else:
-            migrations_complete, pending_migrations = check_migrations_status()
-            if migrations_complete:
-                logger.debug("Миграции базы данных завершены")
-                return True
-            else:
-                logger.warning(f"Миграции базы данных не завершены. Ожидающие: {pending_migrations}")
-                return False
-                
+            logger.warning(f"Миграции базы данных не завершены: {status_message}")
+            return False
+            
     except Exception as e:
         logger.error(f"Ошибка при проверке статуса миграций: {e}")
         return False
